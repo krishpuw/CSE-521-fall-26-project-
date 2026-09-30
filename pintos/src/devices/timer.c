@@ -20,7 +20,7 @@
 /* Number of timer ticks since OS booted. */
 static int64_t ticks;
 
-/* Keeps track of sleeping threads, with the earliest wake time first. */
+/* Threads waiting for their sleep time to finish. */
 static struct list sleeping_threads;
 
 /* Number of loops per timer tick.
@@ -91,13 +91,22 @@ timer_elapsed (int64_t then)
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
    be turned on. */
 void
-timer_sleep (int64_t ticks) 
+timer_sleep (int64_t ticks)
 {
-  int64_t start = timer_ticks ();
+  enum intr_level old_level;
+  struct thread *current;
 
   ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+  if (ticks <= 0)
+    return;
+
+  /* Don't let the timer interrupt run before we finish blocking. */
+  old_level = intr_disable ();
+  current = thread_current ();
+  current->wake_tick = timer_ticks () + ticks;
+  list_push_back (&sleeping_threads, &current->sleep_elem);
+  thread_block ();
+  intr_set_level (old_level);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -174,8 +183,24 @@ timer_print_stats (void)
 static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
+  struct list_elem *e;
+
   ticks++;
   thread_tick ();
+
+  /* Check if any sleeping threads are ready to wake up. */
+  e = list_begin (&sleeping_threads);
+  while (e != list_end (&sleeping_threads))
+    {
+      struct thread *sleeper = list_entry (e, struct thread, sleep_elem);
+      if (sleeper->wake_tick <= ticks)
+        {
+          e = list_remove (e);
+          thread_unblock (sleeper);
+        }
+      else
+        e = list_next (e);
+    }
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
